@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"golang.org/x/xerrors"
@@ -154,18 +156,40 @@ func (c *Client) Download(ctx context.Context, dst string, opt types.RegistryOpt
 	}
 
 	art := c.initOCIArtifact(opt)
-	if err := art.Download(ctx, dst, oci.DownloadOption{MediaType: dbMediaType}); err != nil {
-		var terr *transport.Error
-		if errors.As(err, &terr) {
-			for _, diagnostic := range terr.Errors {
-				// For better user experience
-				if diagnostic.Code == transport.DeniedErrorCode || diagnostic.Code == transport.UnauthorizedErrorCode {
+
+	// retry on non-fatal errors
+	download := func() error {
+		if err := art.Download(ctx, dst, oci.DownloadOption{MediaType: dbMediaType}); err != nil {
+			// handle transport errors
+			var terr *transport.Error
+			if errors.As(err, &terr) {
+				// retry on TOOMANYREQUESTS non-fatal error, but only if there are no other errors
+				if len(terr.Errors) == 1 && terr.Errors[0].Code == transport.TooManyRequestsErrorCode {
+					log.Warnf("Non-fatal error, will retry: %v", err)
+					return err
+				}
+
+				// handle fatal errors
+				// collect transport error codes
+				var codes []transport.ErrorCode
+				for _, c := range terr.Errors {
+					codes = append(codes, c.Code)
+				}
+
+				// if any of these specific errors codes are present, reference docs for better user experience
+				if slices.Contains(codes, transport.DeniedErrorCode) || slices.Contains(codes, transport.UnauthorizedErrorCode) {
 					// e.g. https://aquasecurity.github.io/trivy/latest/docs/references/troubleshooting/#db
 					log.Warnf("See %s", doc.URL("/docs/references/troubleshooting/", "db"))
-					break
 				}
 			}
+			// return permanent error to stop retrying
+			return backoff.Permanent(err)
 		}
+		return nil
+	}
+	// retry with exponential backoff (up to DefaultMaxElapsedTime of 15 mins), taking context into account
+	b := backoff.WithContext(backoff.NewExponentialBackOff(), ctx)
+	if err := backoff.Retry(download, b); err != nil {
 		return xerrors.Errorf("database download error: %w", err)
 	}
 
